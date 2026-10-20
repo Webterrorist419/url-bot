@@ -1,0 +1,172 @@
+#!/usr/bin/python3
+"""Local SSH administration for the packaged URL bot."""
+import argparse
+import grp
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+CONFIG = Path('/etc/url-bot/config.env')
+DATABASE = Path('/var/lib/url-bot/bot.sqlite3')
+SERVICE = 'url-bot.service'
+
+
+def read_config():
+    values = {}
+    if CONFIG.exists():
+        for line in CONFIG.read_text(encoding='utf-8').splitlines():
+            key, sep, value = line.partition('=')
+            if sep and key in {'BOT_TOKEN', 'ADMIN_ID', 'DATABASE_PATH'}:
+                values[key] = value.strip()
+    return values
+
+
+def valid_credentials(values):
+    admin = values.get('ADMIN_ID', '')
+    return bool(re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+', values.get('BOT_TOKEN', ''))
+                and re.fullmatch(r'[1-9][0-9]*', admin)
+                and int(admin) <= 2**63 - 1)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise ValueError('Запустите команду через sudo.')
+
+
+def service(action):
+    return subprocess.run(['systemctl', action, SERVICE], check=False).returncode
+
+
+def configure(field):
+    require_root()
+    print('Enter сохраняет прежнее значение.')
+    old = read_config()
+    token, admin = old.get('BOT_TOKEN', ''), old.get('ADMIN_ID', '')
+    if field == 'token':
+        token = input('Токен бота (ввод отображается): ').strip() or token
+        if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+', token):
+            raise ValueError('Некорректный токен. Настройки не изменены.')
+    elif field == 'admin':
+        admin = input('Telegram ID администратора [{}]: '.format(admin)).strip() or admin
+        if not re.fullmatch(r'[1-9][0-9]*', admin) or int(admin) > 2**63 - 1:
+            raise ValueError('Некорректный ID. Настройки не изменены.')
+    else:
+        raise ValueError('Неизвестная настройка.')
+    values = {'BOT_TOKEN': token, 'ADMIN_ID': admin}
+    gid = grp.getgrnam('urlbot').gr_gid
+    fd, temporary = tempfile.mkstemp(prefix='.config-', dir=str(CONFIG.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
+            stream.write('BOT_TOKEN={}\nADMIN_ID={}\nDATABASE_PATH={}\n'.format(token, admin, DATABASE))
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), 0o640)
+            os.fchown(stream.fileno(), 0, gid)
+        os.replace(temporary, CONFIG)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print('Настройки сохранены в {}.'.format(CONFIG))
+    if not valid_credentials(values):
+        if service('stop'):
+            raise ValueError('Не удалось остановить службу. Проверьте состояние в пункте 3.')
+        print('Для запуска укажите и токен (пункт 1), и ID администратора (пункт 2).')
+        return
+    if service('restart'):
+        raise ValueError('Настройки сохранены, но служба не запустилась. Откройте логи: пункт 7.')
+    print('Бот перезапущен. Состояние: пункт 3.')
+
+
+def uninstall():
+    require_root()
+    print('Будут удалены пакет, бот, служба, токен, ID, база пользователей и настройки бота.')
+    if input('Для полного удаления введите ДА: ').strip() != 'ДА':
+        print('Удаление отменено.')
+        return False
+    if service('stop'):
+        raise ValueError('Не удалось остановить бота. Проверьте состояние в пункте 3.')
+    result = subprocess.run(['apt-get', 'purge', '--yes', 'url-bot'], check=False)
+    if result.returncode:
+        raise ValueError('Удаление не завершено. Проверьте сообщения пакетного менеджера выше.')
+    print('URL Bot удалён вместе с настройками и базой данных.')
+    return True
+
+
+def backup(destination):
+    require_root()
+    if not DATABASE.is_file():
+        raise ValueError('База данных ещё не создана.')
+    target = Path(destination).expanduser().absolute()
+    # Exclusive creation protects existing files and rejects symlinks.
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    try:
+        source = sqlite3.connect(DATABASE.resolve().as_uri() + '?mode=ro', uri=True)
+        try:
+            dest = sqlite3.connect(str(target))
+            try:
+                source.backup(dest)
+                dest.execute('PRAGMA journal_mode=DELETE')
+            finally:
+                dest.close()
+        finally:
+            source.close()
+    except Exception:
+        target.unlink()
+        raise
+    print('Резервная копия: {}'.format(target))
+
+
+def menu():
+    require_root()
+    while True:
+        print('\nURL Bot\n1) Настроить токен бота\n2) Настроить ID администратора\n3) Состояние бота\n4) Перезапустить бота\n5) Остановить бота\n6) Запустить бота\n7) Последние логи\n8) Резервная копия базы\n9) Полностью удалить бота и все его данные\n0) Выход')
+        choice = input('Выберите пункт: ').strip()
+        if choice == '0':
+            return 0
+        try:
+            if choice in {'1', '2'}:
+                configure('token' if choice == '1' else 'admin')
+            elif choice in {'3', '4', '5', '6'}:
+                action = {'3': 'status', '4': 'restart', '5': 'stop', '6': 'start'}[choice]
+                if action in {'start', 'restart'} and not valid_credentials(read_config()):
+                    raise ValueError('Сначала настройте токен и ID: пункты 1 и 2.')
+                service(action)
+            elif choice == '7':
+                subprocess.run(['journalctl', '-u', SERVICE, '-n', '80', '--no-pager'], check=False)
+            elif choice == '8':
+                backup(input('Путь для нового файла .sqlite3: ').strip())
+            elif choice == '9':
+                if uninstall():
+                    return 0
+            else:
+                print('Нет такого пункта. Введите число от 0 до 9.')
+        except (OSError, ValueError, sqlite3.Error) as error:
+            print('Ошибка: {}'.format(error), file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Русское меню URL Bot. Запуск: url-bot')
+    parser.add_argument('--check-config', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.check_config:
+        return 0 if valid_credentials(read_config()) else 1
+    if os.geteuid() != 0:
+        print('Для управления нужны права администратора. Введите пароль sudo, если потребуется.', flush=True)
+        os.execvp('sudo', ['sudo', '--', '/usr/bin/url-bot'])
+    return menu()
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (EOFError, KeyboardInterrupt):
+        print('\nОтменено.', file=sys.stderr)
+        sys.exit(130)
+    except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+        print('Ошибка: {}'.format(error), file=sys.stderr)
+        sys.exit(1)

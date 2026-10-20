@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    fi
+fi
+if [ "$1" = remove ]; then
+    deb-systemd-helper mask url-bot.service >/dev/null
+fi
+if [ "$1" = purge ]; then
+    deb-systemd-helper purge url-bot.service >/dev/null
+    deb-systemd-helper unmask url-bot.service >/dev/null || true
+    # Purge explicitly removes all application configuration and managed data.
+    python3 - <<'PY'
+from pathlib import Path
+import shutil
+for name in ('/var/lib/url-bot', '/etc/url-bot'):
+    target = Path(name)
+    if target.is_symlink():
+        target.unlink()
+    elif target.exists():
+        if target.resolve() != target:
+            raise RuntimeError('Refusing unexpected removal path: ' + name)
+        shutil.rmtree(target)
+PY
+    if getent passwd urlbot >/dev/null; then
+        deluser --system urlbot
+    fi
+    if getent group urlbot >/dev/null; then
+        delgroup --system urlbot
+    fi
+fi

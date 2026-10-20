@@ -1,0 +1,33 @@
+# Credentials and application data
+config.env
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+*.log
+
+# Python and build output
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.build/
+build/
+dist/
+*.spec
+bot-linux-x86_64
+*.deb
+*.zip
+SHA256SUMS
+
+# Unrelated local API reference
+openapi.json
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

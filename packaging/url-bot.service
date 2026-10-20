@@ -1,0 +1,26 @@
+[Unit]
+Description=URL Telegram Bot
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/url-bot/config.env
+
+[Service]
+Type=simple
+User=urlbot
+Group=urlbot
+WorkingDirectory=/var/lib/url-bot
+EnvironmentFile=/etc/url-bot/config.env
+ExecCondition=/usr/bin/url-bot --check-config
+ExecStart=/usr/lib/url-bot/bot-linux-x86_64
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=40
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/url-bot
+
+[Install]
+WantedBy=multi-user.target

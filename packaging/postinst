@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    if ! getent passwd urlbot >/dev/null; then
+        adduser --system --group --home /var/lib/url-bot --no-create-home --shell /usr/sbin/nologin urlbot
+    fi
+    install -d -o urlbot -g urlbot -m 750 /var/lib/url-bot
+    chown root:urlbot /etc/url-bot /etc/url-bot/config.env
+    chmod 750 /etc/url-bot
+    chmod 640 /etc/url-bot/config.env
+    deb-systemd-helper unmask url-bot.service >/dev/null || true
+    if deb-systemd-helper --quiet was-enabled url-bot.service; then
+        deb-systemd-helper enable url-bot.service >/dev/null
+    else
+        deb-systemd-helper update-state url-bot.service >/dev/null
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if /usr/bin/url-bot --check-config; then
+            deb-systemd-invoke restart url-bot.service || true
+        else
+            echo 'URL Bot установлен. Для настройки через SSH выполните: url-bot'
+        fi
+    fi
+fi

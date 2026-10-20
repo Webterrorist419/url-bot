@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: test "$RELEASE_TAG" = "v$(cat VERSION)"
+      - run: python -m pip install -r requirements-build.txt
+      - run: python packaging/build_release.py
+      - run: python packaging/export_source.py
+      - run: python -B -m unittest -v test_broadcast test_bot
+      - run: python -B packaging/test_package.py -v
+      - run: bash -n install.sh
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; keeping its published assets."
+          else
+            gh release create "$RELEASE_TAG" url_bot.deb bot-linux-x86_64 url_bot-source.zip SHA256SUMS \
+              --verify-tag --title "URL Bot $RELEASE_TAG" --generate-notes
+          fi
