@@ -31,6 +31,8 @@ APP_PATH = Path(sys.executable if getattr(sys, "frozen", False) else __file__).r
 CONFIG_PATH = APP_PATH.with_name("config.env")
 STOP = threading.Event()
 BUTTON_COUNT = 5
+LANGUAGES = ("ru", "en")
+BUTTON_STYLES = ("primary", "success", "danger")
 
 
 def read_config(path: Path = CONFIG_PATH) -> dict[str, str]:
@@ -97,7 +99,14 @@ class Database:
             self.connection.execute("CREATE TABLE IF NOT EXISTS admin_state (telegram_id INTEGER PRIMARY KEY, action TEXT NOT NULL)")
             self.connection.execute("""CREATE TABLE IF NOT EXISTS broadcasts (
                 id INTEGER PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft',
-                next_at REAL NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+                next_at REAL NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                lang TEXT NOT NULL DEFAULT '')""")
+            broadcast_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(broadcasts)")}
+            if "lang" not in broadcast_columns:
+                self.connection.execute("ALTER TABLE broadcasts ADD COLUMN lang TEXT NOT NULL DEFAULT ''")
+            # Old running jobs keep their recipient snapshot; old drafts need a new language-specific preview.
+            self.connection.execute("UPDATE broadcasts SET status='cancelled' WHERE lang='' AND status='draft'")
+            self.connection.execute("DELETE FROM admin_state WHERE action='broadcast:compose'")
             self.connection.execute("""CREATE TABLE IF NOT EXISTS broadcast_recipients (
                 job_id INTEGER NOT NULL, user_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
                 PRIMARY KEY(job_id,user_id))""")
@@ -116,6 +125,7 @@ class Database:
                     f"button{n}_label_en": f"Link {n}",
                     f"button{n}_url": "https://example.com",
                     f"button{n}_enabled": "1",
+                    f"button{n}_style": "",
                 })
             self.connection.executemany("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", defaults.items())
 
@@ -131,7 +141,12 @@ class Database:
         row = self.connection.execute("SELECT lang FROM users WHERE telegram_id=?", (user_id,)).fetchone()
         return "en" if row and row[0] == "en" else "ru"
 
+    def has_language(self, user_id: int) -> bool:
+        return self.connection.execute("SELECT 1 FROM users WHERE telegram_id=? AND lang IN ('ru','en')", (user_id,)).fetchone() is not None
+
     def set_language(self, user_id: int, lang: str) -> None:
+        if lang not in LANGUAGES:
+            raise ValueError("Unsupported language")
         with self.connection:
             self.connection.execute("INSERT INTO users(telegram_id,lang,counted) VALUES(?,?,0) ON CONFLICT(telegram_id) DO UPDATE SET lang=excluded.lang", (user_id, lang))
 
@@ -139,8 +154,11 @@ class Database:
         with self.connection:
             self.connection.execute("INSERT INTO users(telegram_id,counted) VALUES(?,1) ON CONFLICT(telegram_id) DO UPDATE SET counted=1", (user_id,))
 
-    def count(self) -> int:
-        return self.connection.execute("SELECT COUNT(*) FROM users WHERE counted=1").fetchone()[0]
+    def count(self, lang: str | None = None) -> int:
+        return self.connection.execute("SELECT COUNT(*) FROM users WHERE counted=1 AND lang IN ('ru','en') AND (? IS NULL OR lang=?)", (lang, lang)).fetchone()[0]
+
+    def audience_count(self, lang: str | None = None) -> int:
+        return self.connection.execute("SELECT COUNT(*) FROM users WHERE lang IN ('ru','en') AND (? IS NULL OR lang=?)", (lang, lang)).fetchone()[0]
 
     def reset_count(self) -> None:
         with self.connection:
@@ -184,7 +202,7 @@ class TelegramAPI:
         request = Request(
             f"https://api.telegram.org/bot{self.token}/{method}",
             data=json.dumps(params, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "URLBot/1.3.0"},
+            headers={"Content-Type": "application/json", "User-Agent": "URLBot/1.4.0"},
         )
         timeout = int(params.get("timeout", 0)) + 15
         for attempt in range(attempts):
@@ -221,8 +239,11 @@ class TelegramAPI:
                     raise TelegramError(503, f"Network/response error ({type(error).__name__})") from None
 
 
-def callback(text: str, data: str) -> dict:
-    return {"text": text, "callback_data": data}
+def callback(text: str, data: str, style: str = "") -> dict:
+    button = {"text": text, "callback_data": data}
+    if style in BUTTON_STYLES:
+        button["style"] = style
+    return button
 
 
 def keyboard(rows: list) -> dict:
@@ -238,7 +259,11 @@ class TelegramBot:
         for n in range(1, BUTTON_COUNT + 1):
             url = self.db.get(f"button{n}_url")
             if self.db.get(f"button{n}_enabled") == "1" and valid_url(url):
-                rows.append([{"text": self.db.get(f"button{n}_label_{lang}"), "url": url}])
+                button = {"text": self.db.get(f"button{n}_label_{lang}"), "url": url}
+                style = self.db.get(f"button{n}_style")
+                if style in BUTTON_STYLES:
+                    button["style"] = style
+                rows.append([button])
         rows.append([callback(pick(lang, "🌐 Язык: RU / EN", "🌐 Language: EN / RU"), "language")])
         if admin:
             rows.append([callback(pick(lang, "⚙️ Админ меню", "⚙️ Admin menu"), "admin")])
@@ -246,7 +271,7 @@ class TelegramBot:
 
     @staticmethod
     def admin_keyboard(lang: str) -> dict:
-        rows = [[callback(pick(lang, f"Ссылка {n}: URL / текст / вкл-выкл", f"Link {n}: URL / label / on-off"), f"button_{n}")] for n in range(1, BUTTON_COUNT + 1)]
+        rows = [[callback(pick(lang, f"Ссылка {n}: URL / текст / цвет / вкл-выкл", f"Link {n}: URL / label / color / on-off"), f"button_{n}")] for n in range(1, BUTTON_COUNT + 1)]
         rows.extend([
             [callback(pick(lang, "📣 Рассылки", "📣 Broadcasts"), "broadcast")],
             [callback(pick(lang, "🔐 Обязательная подписка", "🔐 Required subscription"), "subscription")],
@@ -263,10 +288,35 @@ class TelegramBot:
             [callback(pick(lang, "Изменить URL", "Change URL"), f"edit_url_{n}")],
             [callback(pick(lang, "Текст кнопки (RU)", "Button text (RU)"), f"edit_label_{n}_ru")],
             [callback(pick(lang, "Текст кнопки (EN)", "Button text (EN)"), f"edit_label_{n}_en")],
+            [callback(pick(lang, "🎨 Цвет кнопки", "🎨 Button color"), f"color_{n}")],
             [callback(pick(lang, "🔴 Выключить", "🔴 Disable") if enabled else pick(lang, "🟢 Включить", "🟢 Enable"), f"toggle_{n}")],
             [callback(pick(lang, "↩️ Админ меню", "↩️ Admin menu"), "admin")],
             [callback(pick(lang, "🌐 Язык: RU / EN", "🌐 Language: EN / RU"), "language")],
         ])
+
+    def show_button(self, user_id: int, n: str, notice: str = "") -> None:
+        lang = self.db.language(user_id)
+        style = self.db.get(f"button{n}_style")
+        colors = {"primary": pick(lang, "синий", "blue"), "success": pick(lang, "зелёный", "green"), "danger": pick(lang, "красный", "red")}
+        text = pick(lang,
+            f"Настройки кнопки {n}:\nURL: {self.db.get(f'button{n}_url')}\nRU: {self.db.get(f'button{n}_label_ru')}\nEN: {self.db.get(f'button{n}_label_en')}\nЦвет: {colors.get(style, 'стандартный')}",
+            f"Button {n} settings:\nURL: {self.db.get(f'button{n}_url')}\nRU: {self.db.get(f'button{n}_label_ru')}\nEN: {self.db.get(f'button{n}_label_en')}\nColor: {colors.get(style, 'default')}")
+        self.send(user_id, f"{notice}\n\n{text}" if notice else text, self.button_keyboard(lang, n))
+
+    def show_button_colors(self, user_id: int, n: str) -> None:
+        lang = self.db.language(user_id)
+        current = self.db.get(f"button{n}_style") or "default"
+        options = [("default", "Стандартный", "Default"), ("primary", "🔵 Синий", "🔵 Blue"),
+                   ("success", "🟢 Зелёный", "🟢 Green"), ("danger", "🔴 Красный", "🔴 Red")]
+        rows = [[callback(("✓ " if style == current else "") + pick(lang, ru, en), f"set_color_{n}_{style}", style)] for style, ru, en in options]
+        rows.append([callback(pick(lang, "↩️ К настройкам кнопки", "↩️ Button settings"), f"button_{n}")])
+        self.send(user_id, pick(lang, f"Выберите цвет кнопки {n}:", f"Choose a color for button {n}:"), keyboard(rows))
+
+    def show_languages(self, user_id: int) -> None:
+        self.db.set_state(user_id, "language:choose")
+        self.send(user_id, "Выберите язык / Choose your language:", keyboard([
+            [callback("🇷🇺 Русский", "language_ru"), callback("🇬🇧 English", "language_en")],
+        ]))
 
     def send(self, user_id: int, text: str, markup: dict | None = None) -> None:
         params = {"chat_id": user_id, "text": text}
@@ -275,6 +325,9 @@ class TelegramBot:
         self.api.call("sendMessage", **params)
 
     def home(self, user_id: int) -> None:
+        if not self.db.has_language(user_id) or self.db.state(user_id) == "language:choose":
+            self.show_languages(user_id)
+            return
         lang = self.db.language(user_id)
         if not self.has_access(user_id):
             return
@@ -353,23 +406,25 @@ class TelegramBot:
             return
         user_id = sender["id"]
         lang = self.db.language(user_id)
-        if user_id == self.admin_id and self.db.state(user_id) == "broadcast:compose" and not (isinstance(text, str) and text.startswith("/")):
+        action = self.db.state(user_id)
+        if user_id == self.admin_id and re.fullmatch(r"broadcast:compose:(ru|en)", action) and not (isinstance(text, str) and text.startswith("/")):
             self.prepare_broadcast(message)
             return
         if not isinstance(text, str):
             return
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.strip() else ""
         if command == "/start":
-            self.db.set_state(user_id)
-            self.db.record_start(user_id)
-            self.home(user_id)
+            self.show_languages(user_id)
+            return
+        if not self.db.has_language(user_id) or action == "language:choose":
+            self.show_languages(user_id)
             return
         if user_id != self.admin_id:
             self.has_access(user_id)
             return
         if command == "/cancel":
             self.db.set_state(user_id)
-            self.send(user_id, pick(lang, "Ввод отменён.", "Edit cancelled."), self.admin_keyboard(lang))
+            self.return_from_edit(user_id, action, pick(lang, "Ввод отменён.", "Edit cancelled."))
             return
         if command.startswith("/"):
             self.send(user_id, pick(lang, "Для отмены ввода: /cancel. Главное меню: /start.", "Cancel editing: /cancel. Main menu: /start."))
@@ -417,7 +472,7 @@ class TelegramBot:
         if action.startswith("subscription:"):
             self.show_subscription(user_id)
             return
-        self.send(user_id, pick(lang, "Сохранено.", "Saved."), self.admin_keyboard(lang))
+        self.return_from_edit(user_id, action, pick(lang, "Сохранено.", "Saved."))
 
     def on_callback(self, query: dict) -> None:
         user_id = query.get("from", {}).get("id")
@@ -428,18 +483,19 @@ class TelegramBot:
             self.api.call("answerCallbackQuery", callback_query_id=query["id"])
             return
         lang = self.db.language(user_id)
-        if data not in {"language", "home", "check_subscription"} and user_id != self.admin_id:
+        language_actions = {"language", "language_ru", "language_en"}
+        if data not in language_actions | {"home", "check_subscription"} and user_id != self.admin_id:
             self.api.call("answerCallbackQuery", callback_query_id=query["id"], text=pick(lang, "Нет доступа.", "Access denied."))
             return
-        allowed = data in {"broadcast", "broadcast_new", "language", "admin", "home", "check_subscription", "stats", "reset", "description", "subscription", "subscription_chat", "subscription_url", "subscription_toggle"} or re.fullmatch(r"broadcast_(?:send|cancel)_[0-9]+|(?:button|toggle|edit_url)_[1-5]|edit_label_[1-5]_(?:ru|en)", data)
+        allowed = data in language_actions | {"broadcast", "broadcast_new", "admin", "home", "check_subscription", "stats", "reset", "description", "subscription", "subscription_chat", "subscription_url", "subscription_toggle"} or re.fullmatch(r"broadcast_(?:(?:send|cancel)_[0-9]+|(?:new_)?(?:ru|en))|(?:button|toggle|edit_url|color)_[1-5]|edit_label_[1-5]_(?:ru|en)|set_color_[1-5]_(?:default|primary|success|danger)", data)
         if not allowed:
             self.api.call("answerCallbackQuery", callback_query_id=query["id"])
             return
-        self.db.set_state(user_id)
-        if data == "stats":
-            count = self.db.count()
-            self.api.call("answerCallbackQuery", callback_query_id=query["id"], text=pick(lang, f"Пользователей: {count}", f"Users: {count}"), show_alert=True)
+        if data not in language_actions and (not self.db.has_language(user_id) or self.db.state(user_id) == "language:choose"):
+            self.api.call("answerCallbackQuery", callback_query_id=query["id"])
+            self.show_languages(user_id)
             return
+        self.db.set_state(user_id)
         self.api.call("answerCallbackQuery", callback_query_id=query["id"])
         if message.get("message_id"):
             try:
@@ -447,24 +503,42 @@ class TelegramBot:
             except TelegramError as error:
                 if error.code not in {400, 403}:
                     raise
-        if data == "broadcast":
+        if data in {"broadcast", "broadcast_new"}:
             self.show_broadcasts()
-        elif data == "broadcast_new":
-            self.prompt(user_id, lang, "broadcast:compose", pick(lang, "Отправьте текст, фото, видео, документ, аудио или анимацию с подписью. Альбомы не поддерживаются; отправьте один файл.", "Send text, a photo, video, document, audio or animation with a caption. Send one file, not an album."))
+        elif data in {"broadcast_ru", "broadcast_en"}:
+            self.show_broadcasts(data[-2:])
+        elif data in {"broadcast_new_ru", "broadcast_new_en"}:
+            target = data[-2:]
+            self.prompt(user_id, lang, f"broadcast:compose:{target}", pick(lang,
+                f"Рассылка для {target.upper()}. Отправьте текст, фото, видео, документ, аудио или анимацию с подписью. Альбомы не поддерживаются; отправьте один файл.",
+                f"Broadcast to {target.upper()}. Send text, a photo, video, document, audio or animation with a caption. Send one file, not an album."))
         elif data.startswith("broadcast_send_"):
             job_id = int(data.rsplit("_", 1)[1])
+            job = self.db.connection.execute("SELECT lang,status FROM broadcasts WHERE id=?", (job_id,)).fetchone()
+            if not job or job[0] not in LANGUAGES:
+                self.show_broadcasts()
+                return
+            target, status = job
             with self.db.connection as conn:
-                if not conn.execute("SELECT 1 FROM broadcasts WHERE status='running'").fetchone():
+                busy = conn.execute("SELECT 1 FROM broadcasts WHERE status='running'").fetchone()
+                if not busy:
                     changed = conn.execute("UPDATE broadcasts SET status='running' WHERE id=? AND status='draft'", (job_id,)).rowcount
                     if changed:
-                        conn.execute("INSERT INTO broadcast_recipients(job_id,user_id) SELECT ?,telegram_id FROM users", (job_id,))
-            self.show_broadcasts()
+                        conn.execute("INSERT INTO broadcast_recipients(job_id,user_id) SELECT ?,telegram_id FROM users WHERE lang=?", (job_id, target))
+            if busy and status == "draft":
+                self.send(user_id, pick(lang, "Другая рассылка ещё выполняется. Черновик сохранён; отправьте его после завершения текущей рассылки.", "Another broadcast is still running. Your draft is saved; send it after the current broadcast finishes."))
+            self.show_broadcasts(target)
         elif data.startswith("broadcast_cancel_"):
+            job_id = int(data.rsplit("_", 1)[1])
+            job = self.db.connection.execute("SELECT lang FROM broadcasts WHERE id=?", (job_id,)).fetchone()
             with self.db.connection as conn:
-                conn.execute("UPDATE broadcasts SET status='cancelled' WHERE id=? AND status IN ('draft','running')", (int(data.rsplit("_", 1)[1]),))
-            self.show_broadcasts()
+                conn.execute("UPDATE broadcasts SET status='cancelled' WHERE id=? AND status IN ('draft','running')", (job_id,))
+            self.show_broadcasts(job[0] if job and job[0] in LANGUAGES else None)
         elif data == "language":
-            self.db.set_language(user_id, "ru" if lang == "en" else "en")
+            self.show_languages(user_id)
+        elif data in {"language_ru", "language_en"}:
+            self.db.set_language(user_id, data[-2:])
+            self.db.record_start(user_id)
             self.home(user_id)
         elif data in {"home", "check_subscription"}:
             self.home(user_id)
@@ -489,30 +563,75 @@ class TelegramBot:
             self.show_subscription(user_id)
         elif data == "admin":
             self.send(user_id, pick(lang, "Админ меню:", "Admin menu:"), self.admin_keyboard(lang))
+        elif data == "stats":
+            self.show_stats(user_id)
         elif data == "reset":
             self.db.reset_count()
-            self.send(user_id, pick(lang, "Статистика очищена. Пользователи будут учтены снова после /start.", "Statistics cleared. Users will be counted again after /start."), self.admin_keyboard(lang))
+            self.send(user_id, pick(lang, "Статистика очищена. Пользователи будут учтены снова после выбора языка.", "Statistics cleared. Users will be counted again after choosing a language."))
+            self.show_stats(user_id)
         elif data == "description":
             self.prompt(user_id, lang, f"desc:{lang}", pick(lang, "Отправьте новое описание на текущем языке:", "Send the new description in the current language:"))
         elif data.startswith("button_"):
-            n = data[-1]
-            self.send(user_id, pick(lang, f"Настройки кнопки {n}:", f"Button {n} settings:"), self.button_keyboard(lang, n))
+            self.show_button(user_id, data[-1])
         elif data.startswith("toggle_"):
             n = data[-1]
             self.db.put(f"button{n}_enabled", "0" if self.db.get(f"button{n}_enabled") == "1" else "1")
-            self.send(user_id, pick(lang, "Состояние кнопки сохранено.", "Button state saved."), self.button_keyboard(lang, n))
+            self.show_button(user_id, n, pick(lang, "Состояние кнопки сохранено.", "Button state saved."))
+        elif data.startswith("color_"):
+            self.show_button_colors(user_id, data[-1])
+        elif data.startswith("set_color_"):
+            _, _, n, style = data.split("_")
+            self.db.put(f"button{n}_style", "" if style == "default" else style)
+            self.show_button(user_id, n, pick(lang, "Цвет кнопки сохранён.", "Button color saved."))
         elif data.startswith("edit_url_"):
             self.prompt(user_id, lang, f"url:{data[-1]}", pick(lang, "Отправьте новый URL (http:// или https://):", "Send a new URL (http:// or https://):"))
         elif data.startswith("edit_label_"):
             _, _, n, lc = data.split("_")
             self.prompt(user_id, lang, f"label:{n}:{lc}", pick(lang, f"Отправьте текст кнопки {n} на языке {lc.upper()}:", f"Send the text for button {n} in {lc.upper()}:"))
 
+    @staticmethod
+    def edit_destination(action: str) -> str:
+        if match := re.fullmatch(r"(?:url|label):([1-5])(?::(?:ru|en))?", action):
+            return f"button_{match[1]}"
+        if action.startswith("subscription:"):
+            return "subscription"
+        if match := re.fullmatch(r"broadcast:compose:(ru|en)", action):
+            return f"broadcast_{match[1]}"
+        return "admin"
+
+    def return_from_edit(self, user_id: int, action: str, notice: str) -> None:
+        destination = self.edit_destination(action)
+        if destination.startswith("button_"):
+            self.show_button(user_id, destination[-1], notice)
+        elif destination == "subscription":
+            self.show_subscription(user_id)
+        elif destination.startswith("broadcast_"):
+            self.show_broadcasts(destination[-2:])
+        else:
+            self.send(user_id, notice, self.admin_keyboard(self.db.language(user_id)))
+
+    def show_stats(self, user_id: int) -> None:
+        lang = self.db.language(user_id)
+        text = pick(lang,
+            f"📊 Статистика\n\nПользователей после сброса: {self.db.count()}\n🇷🇺 RU: {self.db.count('ru')}\n🇬🇧 EN: {self.db.count('en')}\n\nПолучатели рассылок: {self.db.audience_count()}\n🇷🇺 RU: {self.db.audience_count('ru')}\n🇬🇧 EN: {self.db.audience_count('en')}\n\nУчитываются уникальные пользователи, выбравшие язык. При смене языка пользователь переносится в соответствующую группу.",
+            f"📊 Statistics\n\nUsers since reset: {self.db.count()}\n🇷🇺 RU: {self.db.count('ru')}\n🇬🇧 EN: {self.db.count('en')}\n\nBroadcast recipients: {self.db.audience_count()}\n🇷🇺 RU: {self.db.audience_count('ru')}\n🇬🇧 EN: {self.db.audience_count('en')}\n\nUnique users who chose a language are counted. Changing language moves the user to the corresponding group.")
+        self.send(user_id, text, keyboard([
+            [callback(pick(lang, "Обновить", "Refresh"), "stats")],
+            [callback(pick(lang, "🗑 Сбросить статистику", "🗑 Reset statistics"), "reset")],
+            [callback(pick(lang, "↩️ Админ меню", "↩️ Admin menu"), "admin")],
+        ]))
+
     def prompt(self, user_id: int, lang: str, action: str, text: str) -> None:
         self.db.set_state(user_id, action)
-        self.send(user_id, text + pick(lang, "\nОтмена: /cancel", "\nCancel: /cancel"), keyboard([[callback(pick(lang, "↩️ Отмена", "↩️ Cancel"), "admin")]]))
+        self.send(user_id, text + pick(lang, "\nОтмена: /cancel", "\nCancel: /cancel"), keyboard([[callback(pick(lang, "↩️ Отмена", "↩️ Cancel"), self.edit_destination(action))]]))
 
     def prepare_broadcast(self, message: dict) -> None:
         lang = self.db.language(self.admin_id)
+        match = re.fullmatch(r"broadcast:compose:(ru|en)", self.db.state(self.admin_id))
+        if not match:
+            self.show_broadcasts()
+            return
+        target = match[1]
         if message.get("media_group_id"):
             self.send(self.admin_id, pick(lang, "Пришлите один файл, без альбома.", "Send one file without an album."))
             return
@@ -533,37 +652,49 @@ class TelegramBot:
         method = params.pop("method")
         self.api.call(method, chat_id=self.admin_id, **params)
         with self.db.connection as conn:
-            conn.execute("UPDATE broadcasts SET status='cancelled' WHERE status='draft'")
-            job_id = conn.execute("INSERT INTO broadcasts(payload) VALUES(?)", (json.dumps(payload, ensure_ascii=False),)).lastrowid
+            conn.execute("UPDATE broadcasts SET status='cancelled' WHERE status='draft' AND lang=?", (target,))
+            job_id = conn.execute("INSERT INTO broadcasts(payload,lang) VALUES(?,?)", (json.dumps(payload, ensure_ascii=False), target)).lastrowid
             conn.execute("DELETE FROM admin_state WHERE telegram_id=?", (self.admin_id,))
-        count = self.db.connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        self.send(self.admin_id, pick(lang, f"Предпросмотр выше. Получателей сейчас: {count}. Отправить всем пользователям?", f"Preview above. Current recipients: {count}. Send to all users?"), keyboard([
-            [callback(pick(lang, "Отправить всем", "Send to all"), f"broadcast_send_{job_id}")],
+        count = self.db.audience_count(target)
+        self.send(self.admin_id, pick(lang,
+            f"Предпросмотр выше. Язык рассылки: {target.upper()}. Получателей сейчас: {count}. Отправить пользователям {target.upper()}?",
+            f"Preview above. Broadcast language: {target.upper()}. Current recipients: {count}. Send to {target.upper()} users?"), keyboard([
+            [callback(pick(lang, f"Отправить для {target.upper()}", f"Send to {target.upper()}"), f"broadcast_send_{job_id}")],
             [callback(pick(lang, "Отменить", "Cancel"), f"broadcast_cancel_{job_id}")]]))
 
-    def show_broadcasts(self) -> None:
+    def show_broadcasts(self, target: str | None = None) -> None:
         lang = self.db.language(self.admin_id)
-        lines = [pick(lang, "Рассылки (последние 5):", "Broadcasts (latest 5):")]
-        rows = [[callback(pick(lang, "Создать рассылку", "New broadcast"), "broadcast_new")]]
+        if target in LANGUAGES:
+            lines = [pick(lang, f"Рассылки {target.upper()} (последние 5):\nПолучателей сейчас: {self.db.audience_count(target)}", f"{target.upper()} broadcasts (latest 5):\nCurrent recipients: {self.db.audience_count(target)}")]
+            rows = [[callback(pick(lang, f"Создать рассылку для {target.upper()}", f"New broadcast for {target.upper()}"), f"broadcast_new_{target}")]]
+        else:
+            target = None
+            lines = [pick(lang, "Выберите язык рассылки. Последние 5 заданий:", "Choose the broadcast language. Latest 5 jobs:")]
+            rows = [[callback(f"🇷🇺 RU · {self.db.audience_count('ru')}", "broadcast_ru"),
+                     callback(f"🇬🇧 EN · {self.db.audience_count('en')}", "broadcast_en")]]
         labels = {"draft": "черновик", "running": "отправляется", "done": "завершена", "cancelled": "отменена"}
-        for job_id, status in self.db.connection.execute("SELECT id,status FROM broadcasts ORDER BY id DESC LIMIT 5"):
+        for job_id, status, job_lang in self.db.connection.execute("SELECT id,status,lang FROM broadcasts WHERE (? IS NULL OR lang=?) ORDER BY id DESC LIMIT 5", (target, target)):
             counts = dict(self.db.connection.execute("SELECT status,COUNT(*) FROM broadcast_recipients WHERE job_id=? GROUP BY status", (job_id,)))
-            lines.append(f"#{job_id}: {labels.get(status, status) if lang == 'ru' else status}\n" + pick(lang,
+            audience = job_lang.upper() if job_lang in LANGUAGES else pick(lang, "прежняя: все языки", "legacy: all languages")
+            lines.append(f"#{job_id} [{audience}]: {labels.get(status, status) if lang == 'ru' else status}\n" + pick(lang,
                 f"Доставлено: {counts.get('sent',0)}, ошибки: {counts.get('failed',0)}, неизвестно: {counts.get('unknown',0)}, осталось: {counts.get('pending',0)}",
                 f"Sent: {counts.get('sent',0)}, failed: {counts.get('failed',0)}, unknown: {counts.get('unknown',0)}, pending: {counts.get('pending',0)}"))
             if status in {"draft", "running"}:
                 rows.append([callback(pick(lang, f"Отменить #{job_id}", f"Cancel #{job_id}"), f"broadcast_cancel_{job_id}")])
-            if status == "draft":
-                rows.append([callback(pick(lang, f"Отправить #{job_id} всем", f"Send #{job_id} to all"), f"broadcast_send_{job_id}")])
-        rows.extend([[callback(pick(lang, "Обновить", "Refresh"), "broadcast")], [callback(pick(lang, "Админ меню", "Admin menu"), "admin")]])
+            if status == "draft" and job_lang in LANGUAGES:
+                rows.append([callback(pick(lang, f"Отправить #{job_id} для {job_lang.upper()}", f"Send #{job_id} to {job_lang.upper()}"), f"broadcast_send_{job_id}")])
+        rows.append([callback(pick(lang, "Обновить", "Refresh"), f"broadcast_{target}" if target else "broadcast")])
+        if target:
+            rows.append([callback(pick(lang, "↩️ Выбрать язык рассылки", "↩️ Choose broadcast language"), "broadcast")])
+        rows.append([callback(pick(lang, "Админ меню", "Admin menu"), "admin")])
         self.send(self.admin_id, "\n\n".join(lines), keyboard(rows))
 
     def broadcast_tick(self, stop: threading.Event = STOP) -> None:
         conn = self.db.connection
-        job = conn.execute("SELECT id,payload FROM broadcasts WHERE status='running' AND next_at<=? ORDER BY id LIMIT 1", (time.time(),)).fetchone()
+        job = conn.execute("SELECT id,payload,lang FROM broadcasts WHERE status='running' AND next_at<=? ORDER BY id LIMIT 1", (time.time(),)).fetchone()
         if not job:
             return
-        job_id, raw = job
+        job_id, raw, target = job
         for _ in range(10):
             if stop.is_set():
                 return
@@ -571,7 +702,7 @@ class TelegramBot:
             if recipient is None:
                 with conn:
                     conn.execute("UPDATE broadcasts SET status='done' WHERE id=?", (job_id,))
-                self.show_broadcasts()
+                self.show_broadcasts(target if target in LANGUAGES else None)
                 return
             user_id = recipient[0]
             with conn:
