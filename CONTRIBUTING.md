@@ -18,7 +18,7 @@ python3 -B packaging/test_package.py -v
 ```
 
 Describe behavior changes and the checks you ran in pull requests. Keep the
-Russian and English bot messages aligned. Do not change existing SQLite
+Russian, English, Simplified Chinese and Persian bot messages aligned. Do not change existing SQLite
 settings or callback identifiers without a compatible migration.
 
 For a release, update `VERSION`, the bot's User-Agent version, and

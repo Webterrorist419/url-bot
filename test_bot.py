@@ -1,11 +1,12 @@
 """Regression checks for the existing link, language and subscription behavior."""
+import ast
 import os
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from bot import Database, TelegramBot, TelegramError, database_path, read_config
+from bot import Database, LANGUAGES, LANGUAGE_LABELS, TelegramBot, TelegramError, database_path, read_config
 
 
 class BotTests(unittest.TestCase):
@@ -74,7 +75,7 @@ class BotTests(unittest.TestCase):
         self.assertFalse(self.db.has_language(42))
         self.assertEqual(self.db.count(), 0)
         choices = self.last_markup()
-        self.assertEqual({button['callback_data'] for row in choices['inline_keyboard'] for button in row}, {'language_ru', 'language_en'})
+        self.assertEqual({button['callback_data'] for row in choices['inline_keyboard'] for button in row}, {f'language_{code}' for code in LANGUAGES})
         for data in ('home', 'check_subscription'):
             self.click(data, 42)
             self.assertEqual(self.last_markup(), choices)
@@ -159,7 +160,7 @@ class BotTests(unittest.TestCase):
         for style in ('primary', 'success', 'danger'):
             self.click(f'set_color_3_{style}')
             self.assertEqual(self.last_markup(), self.bot.button_keyboard('ru', '3'))
-            for lang in ('ru', 'en'):
+            for lang in LANGUAGES:
                 self.assertEqual(self.bot.main_keyboard(lang)['inline_keyboard'][2][0]['style'], style)
         self.db.close()
         self.db = Database(self.path)
@@ -210,6 +211,133 @@ class BotTests(unittest.TestCase):
         self.api.reset_mock()
         self.assertTrue(self.bot.has_access(1))
         self.api.call.assert_not_called()
+
+    def test_chinese_and_persian_onboarding_statistics_and_persistence(self):
+        for uid, lang in [(42, 'zh'), (43, 'fa')]:
+            self.message('/start', uid)
+            choices = [b for row in self.last_markup()['inline_keyboard'] for b in row]
+            self.assertEqual([b['text'] for b in choices], list(LANGUAGE_LABELS.values()))
+            self.assertFalse(self.db.has_language(uid))
+            self.click(f'language_{lang}', uid)
+            self.assertEqual(self.db.language(uid), lang)
+            self.assertTrue(self.db.has_language(uid))
+            self.assertEqual(self.api.call.call_args.kwargs['text'], self.db.get(f'description_{lang}'))
+            self.assertEqual([row[0]['text'] for row in self.last_markup()['inline_keyboard'][:5]],
+                             [self.db.get(f'button{n}_label_{lang}') for n in range(1, 6)])
+        self.assertEqual((self.db.count('zh'), self.db.count('fa')), (1, 1))
+        self.click('stats')
+        self.assertIn('🇨🇳 ZH: 1\n🇮🇷 FA: 1', self.api.call.call_args.kwargs['text'])
+        self.click('reset')
+        self.assertEqual(self.db.count(), 0)
+        self.assertEqual(self.db.audience_count(), 3)
+        self.click('language_zh', 42)
+        self.click('language_fa', 42)
+        self.assertEqual((self.db.count('zh'), self.db.count('fa')), (0, 1))
+        self.assertEqual((self.db.audience_count('zh'), self.db.audience_count('fa')), (0, 2))
+        self.db.close()
+        self.db = Database(self.path)
+        self.bot.db = self.db
+        self.assertEqual(self.db.language(42), 'fa')
+        self.assertEqual(self.db.language(43), 'fa')
+
+    def test_new_language_button_description_edits_and_cancellation(self):
+        old_ru = self.db.get('button2_label_ru')
+        old_en = self.db.get('button2_label_en')
+        for lang, label, description in [('zh', '我的网站', '欢迎使用链接菜单！'), ('fa', 'وب‌سایت من', 'به منوی پیوندها خوش آمدید!')]:
+            self.db.set_language(1, lang)
+            self.click(f'edit_label_2_{lang}')
+            self.assertEqual(self.db.state(1), f'label:2:{lang}')
+            self.message('x' * 65)
+            self.assertEqual(self.db.state(1), f'label:2:{lang}')
+            self.message(label)
+            self.assertEqual(self.db.get(f'button2_label_{lang}'), label)
+            self.assertEqual(self.last_markup(), self.bot.button_keyboard(lang, '2'))
+            self.click(f'edit_label_2_{lang}')
+            self.message('/cancel')
+            self.assertEqual(self.db.state(1), '')
+            self.assertEqual(self.last_markup(), self.bot.button_keyboard(lang, '2'))
+            self.click('description')
+            self.assertEqual(self.db.state(1), f'desc:{lang}')
+            self.message(description)
+            self.click('home')
+            self.assertEqual(self.api.call.call_args.kwargs['text'], description)
+        self.assertEqual(self.db.get('button2_label_ru'), old_ru)
+        self.assertEqual(self.db.get('button2_label_en'), old_en)
+        self.db.close()
+        self.db = Database(self.path)
+        self.bot.db = self.db
+        self.assertEqual(self.db.get('button2_label_zh'), '我的网站')
+        self.assertEqual(self.db.get('button2_label_fa'), 'وب‌سایت من')
+
+    def test_admin_controls_are_localized_in_chinese_and_persian(self):
+        for lang, header, refresh, draft in [('zh', '管理菜单', '刷新', '草稿'), ('fa', 'منوی مدیریت', 'تازه‌سازی', 'پیش‌نویس')]:
+            self.db.set_language(1, lang)
+            self.click('admin')
+            self.assertIn(header, self.api.call.call_args.kwargs['text'])
+            for method in (lambda: self.click('button_1'), lambda: self.click('color_1'),
+                           lambda: self.click('subscription'), lambda: self.click('stats'), lambda: self.click('broadcast')):
+                method()
+                for row in self.last_markup()['inline_keyboard']:
+                    for button in row:
+                        self.assertNotRegex(button['text'], r'[А-Яа-яЁё]')
+                        self.assertTrue(1 <= len(button['text']) <= 64)
+            self.click('button_1')
+            edits = [b['callback_data'] for row in self.last_markup()['inline_keyboard'] for b in row if b['callback_data'].startswith('edit_label_')]
+            self.assertEqual(edits, [f'edit_label_1_{code}' for code in LANGUAGES])
+            self.click('stats')
+            self.assertEqual(self.last_markup()['inline_keyboard'][0][0]['text'], refresh)
+            self.click(f'broadcast_new_{lang}')
+            self.message('测试消息' if lang == 'zh' else 'پیام آزمایشی')
+            self.click(f'broadcast_{lang}')
+            self.assertIn(draft, self.api.call.call_args.kwargs['text'])
+
+    def test_new_language_subscription_checks_and_error_messages(self):
+        self.db.put('subscription_enabled', '1')
+        self.db.put('subscription_chat', '-1001234567890')
+        self.db.put('subscription_url', 'https://t.me/example_channel')
+        for uid, lang, join, error in [(42, 'zh', '请先加入', '无法验证'), (43, 'fa', 'ابتدا عضو', 'بررسی عضویت ممکن نشد')]:
+            self.api.reset_mock(side_effect=True)
+            self.api.call.return_value = {'status': 'left'}
+            self.message('/start', uid)
+            self.assertFalse(any(call.args[0] == 'getChatMember' for call in self.api.call.call_args_list))
+            self.click(f'language_{lang}', uid)
+            self.assertIn(join, self.api.call.call_args.kwargs['text'])
+            self.assertIn('https://t.me/example_channel', str(self.last_markup()))
+            # Answer/send operations work while the membership endpoint fails.
+            def unavailable(method, **params):
+                if method == 'getChatMember':
+                    raise TelegramError(503, 'offline')
+            self.api.call.side_effect = unavailable
+            self.assertFalse(self.bot.has_access(uid))
+            self.assertIn(error, self.api.call.call_args.kwargs['text'])
+            self.api.call.side_effect = None
+            self.api.call.return_value = {'status': 'member'}
+            self.click('check_subscription', uid)
+            self.assertEqual(self.last_markup(), self.bot.main_keyboard(lang))
+
+    def test_database_adds_new_defaults_without_overwriting_existing_settings(self):
+        self.db.put('button1_label_ru', 'Моя ссылка')
+        self.db.put('description_en', 'My custom welcome')
+        self.db.set_language(42, 'en')
+        with self.db.connection:
+            self.db.connection.execute("DELETE FROM settings WHERE key LIKE '%_zh' OR key LIKE '%_fa'")
+        self.db.close()
+        self.db = Database(self.path)
+        self.bot.db = self.db
+        self.assertEqual(self.db.get('button1_label_ru'), 'Моя ссылка')
+        self.assertEqual(self.db.get('description_en'), 'My custom welcome')
+        self.assertEqual(self.db.language(42), 'en')
+        for lang in ('zh', 'fa'):
+            self.assertTrue(self.db.get(f'description_{lang}'))
+            self.assertTrue(all(self.db.get(f'button{n}_label_{lang}') for n in range(1, 6)))
+
+    def test_all_translation_calls_supply_four_languages_and_python310_syntax(self):
+        import bot
+        source = Path(bot.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(source, feature_version=(3, 10))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'pick':
+                self.assertEqual(len(node.args), 5, f'Incomplete translation at line {node.lineno}')
 
     def test_config_values_are_literal_and_environment_wins(self):
         path = Path(self.temp.name) / 'config.env'

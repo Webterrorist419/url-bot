@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add Simplified Chinese (`zh`) and Persian (`fa`) to the language picker,
+  user messages, subscription checks and the complete Telegram admin interface.
+- Add separate descriptions and editable link labels for all four languages.
+- Extend statistics, broadcast audiences, drafts, history and restart recovery
+  to ZH/FA while preserving existing RU/EN data and recipient snapshots.
+
 ## 1.4.0
 
 - Require explicit RU/EN selection after `/start` before opening the menu or

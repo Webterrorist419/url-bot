@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from bot import Database, TelegramBot, TelegramError
+from bot import Database, LANGUAGES, TelegramBot, TelegramError
 
 
 class BroadcastTests(unittest.TestCase):
@@ -188,6 +188,65 @@ class BroadcastTests(unittest.TestCase):
                 self.assertEqual(upgraded.connection.execute('SELECT COUNT(*) FROM broadcast_recipients WHERE job_id=1').fetchone()[0], 0)
             finally:
                 upgraded.close()
+
+    def test_chinese_and_persian_audiences_are_isolated_and_snapshot_is_fixed(self):
+        for uid, lang in [(2, 'zh'), (3, 'fa'), (4, 'zh'), (5, 'fa')]:
+            self.db.set_language(uid, lang)
+        self.click('broadcast')
+        choices = [b['callback_data'] for row in self.api.call.call_args.kwargs['reply_markup']['inline_keyboard'][:2] for b in row]
+        self.assertEqual(choices, [f'broadcast_{code}' for code in LANGUAGES])
+        self.prepare('zh')
+        self.assertIn('Получателей сейчас: 2', self.api.call.call_args.kwargs['text'])
+        self.click('broadcast_send_1')
+        self.db.set_language(2, 'fa')
+        self.db.set_language(6, 'zh')
+        self.api.reset_mock()
+        self.bot.broadcast_tick()
+        deliveries = [call.kwargs['chat_id'] for call in self.api.call.call_args_list if call.kwargs.get('_broadcast')]
+        self.assertEqual(deliveries, [2, 4])
+        self.prepare('fa')
+        self.click('broadcast_send_2')
+        self.assertEqual(list(self.db.connection.execute('SELECT user_id FROM broadcast_recipients WHERE job_id=2 ORDER BY user_id')), [(2,), (3,), (5,)])
+
+    def test_four_languages_keep_independent_drafts_and_cancel_destinations(self):
+        for target in LANGUAGES:
+            self.prepare(target)
+        self.prepare('zh')
+        self.assertEqual(list(self.db.connection.execute('SELECT lang,status FROM broadcasts ORDER BY id')),
+                         [('ru', 'draft'), ('en', 'draft'), ('zh', 'cancelled'), ('fa', 'draft'), ('zh', 'draft')])
+        for target in ('zh', 'fa'):
+            self.click(f'broadcast_new_{target}')
+            self.assertEqual(self.db.state(1), f'broadcast:compose:{target}')
+            self.assertEqual(self.api.call.call_args.kwargs['reply_markup']['inline_keyboard'][0][0]['callback_data'], f'broadcast_{target}')
+            self.bot.on_message({'from': {'id': 1}, 'chat': {'id': 1, 'type': 'private'}, 'text': '/cancel'})
+            self.assertEqual(self.db.state(1), '')
+            self.assertIn(f'Рассылки {target.upper()}', self.api.call.call_args.kwargs['text'])
+        self.click('broadcast_fa')
+        self.assertIn('#4 [FA]', self.api.call.call_args.kwargs['text'])
+        self.assertNotIn('#5', self.api.call.call_args.kwargs['text'])
+
+    def test_new_language_unicode_payload_and_composer_survive_restart(self):
+        for target, content in [('zh', '欢迎！服务消息已更新。'), ('fa', 'خوش آمدید! پیام‌های سرویس به‌روز شدند.')]:
+            self.click(f'broadcast_new_{target}')
+            self.db.close()
+            self.db = Database(self.path)
+            self.bot.db = self.db
+            self.assertEqual(self.db.state(1), f'broadcast:compose:{target}')
+            self.bot.on_message({'from': {'id': 1}, 'chat': {'id': 1, 'type': 'private'}, 'text': content,
+                                 'entities': [{'type': 'bold', 'offset': 0, 'length': 2}]})
+            raw = self.db.connection.execute('SELECT payload FROM broadcasts WHERE lang=? ORDER BY id DESC LIMIT 1', (target,)).fetchone()[0]
+            self.assertEqual(json.loads(raw)['text'], content)
+            self.assertEqual(json.loads(raw)['entities'], [{'type': 'bold', 'offset': 0, 'length': 2}])
+            self.assertEqual(self.db.state(1), '')
+
+    def test_new_language_broadcasts_are_admin_only(self):
+        self.db.set_language(2, 'fa')
+        for action in ('broadcast_zh', 'broadcast_fa', 'broadcast_new_zh', 'broadcast_new_fa', 'edit_label_1_fa'):
+            self.click(action, 2)
+            self.assertEqual(self.api.call.call_args.args[0], 'answerCallbackQuery')
+            self.assertEqual(self.api.call.call_args.kwargs['text'], 'دسترسی ندارید.')
+        self.assertEqual(self.db.state(2), '')
+        self.assertEqual(self.db.connection.execute('SELECT COUNT(*) FROM broadcasts').fetchone()[0], 0)
 
 
 if __name__ == '__main__':
