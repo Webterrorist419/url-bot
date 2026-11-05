@@ -219,7 +219,7 @@ class TelegramAPI:
         request = Request(
             f"https://api.telegram.org/bot{self.token}/{method}",
             data=json.dumps(params, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "User-Agent": "URLBot/1.4.0"},
+            headers={"Content-Type": "application/json", "User-Agent": "URLBot/1.5.0"},
         )
         timeout = int(params.get("timeout", 0)) + 15
         for attempt in range(attempts):

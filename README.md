@@ -21,8 +21,7 @@ url-bot
 
 [Скачать последнюю версию url_bot.deb](https://github.com/Webterrorist419/url-bot/releases/latest/download/url_bot.deb).
 Если пакет уже скачан, начните с `sudo apt install ./url_bot.deb`.
-Изменения из раздела `Unreleased` в [CHANGELOG.md](CHANGELOG.md) доступны в
-исходниках; для включения их в `.deb` нужна новая сборка пакета.
+Китайский и персидский языки доступны начиная с версии **1.5.0**.
 
 В меню задайте токен бота и Telegram ID администратора. После заполнения обоих
 полей служба запустится. Управление: `url-bot`, логи:

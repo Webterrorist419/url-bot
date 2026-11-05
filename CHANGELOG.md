@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 — 2026-11-05
 
 - Add Simplified Chinese (`zh`) and Persian (`fa`) to the language picker,
   user messages, subscription checks and the complete Telegram admin interface.
